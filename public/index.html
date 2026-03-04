@@ -928,20 +928,31 @@ function initSocket() {
 
   // ─── WebRTC signaling ───
   S.socket.on('webrtc_offer', async ({ offer }) => {
-    if (!S.pc) return;
-    await S.pc.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer = await S.pc.createAnswer();
-    await S.pc.setLocalDescription(answer);
-    S.socket.emit('webrtc_answer', { answer });
+    if (!S.pc) {
+      // PC not ready yet — buffer it
+      _pendingOffer = offer;
+      return;
+    }
+    await handleOffer(offer);
   });
 
   S.socket.on('webrtc_answer', async ({ answer }) => {
     if (!S.pc) return;
     await S.pc.setRemoteDescription(new RTCSessionDescription(answer));
+    // Drain any buffered ICE candidates
+    for (const c of _pendingCandidates) {
+      try { await S.pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
+    }
+    _pendingCandidates = [];
   });
 
   S.socket.on('webrtc_ice_candidate', async ({ candidate }) => {
-    if (!S.pc || !candidate) return;
+    if (!candidate) return;
+    if (!S.pc || !S.pc.remoteDescription) {
+      // Buffer candidates until remote description is set
+      _pendingCandidates.push(candidate);
+      return;
+    }
     try { await S.pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e) {}
   });
 
@@ -992,22 +1003,29 @@ const ICE_SERVERS = {
   ]
 };
 
+// Buffer for early-arriving signals
+let _pendingOffer = null;
+let _pendingCandidates = [];
+
 async function startWebRTC(isInitiator) {
+  _pendingOffer      = null;
+  _pendingCandidates = [];
+
   setVideoStatus('yellow', 'Requesting camera & mic…');
+
+  // Get media first
   try {
     S.localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-  } catch(err) {
-    // camera denied — try audio only, then nothing
+  } catch(e) {
     try {
       S.localStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
       setVideoStatus('yellow', 'Camera denied — audio only');
-    } catch(e) {
+    } catch(e2) {
       S.localStream = null;
-      setVideoStatus('red', 'Camera/mic denied — text only');
+      setVideoStatus('yellow', 'No camera/mic — connecting anyway…');
     }
   }
 
-  // Show local video
   if (S.localStream) {
     document.getElementById('local-video').srcObject = S.localStream;
   }
@@ -1015,54 +1033,69 @@ async function startWebRTC(isInitiator) {
   // Create peer connection
   S.pc = new RTCPeerConnection(ICE_SERVERS);
 
-  // Add local tracks
   if (S.localStream) {
     S.localStream.getTracks().forEach(track => S.pc.addTrack(track, S.localStream));
   }
 
-  // Remote stream → video element
-  S.pc.ontrack = (event) => {
-    const remoteVideo = document.getElementById('remote-video');
-    if (remoteVideo.srcObject !== event.streams[0]) {
-      remoteVideo.srcObject = event.streams[0];
-      setVideoStatus('green', `Connected to ${S.partnerAlias}`);
+  S.pc.ontrack = (e) => {
+    const rv = document.getElementById('remote-video');
+    if (rv.srcObject !== e.streams[0]) {
+      rv.srcObject = e.streams[0];
+      setVideoStatus('green', `Video live — ${S.partnerAlias}`);
     }
   };
 
-  // ICE candidates → relay via socket
-  S.pc.onicecandidate = (event) => {
-    if (event.candidate) {
-      S.socket.emit('webrtc_ice_candidate', { candidate: event.candidate });
+  S.pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      S.socket.emit('webrtc_ice_candidate', { candidate: e.candidate });
     }
   };
 
   S.pc.onconnectionstatechange = () => {
-    const state = S.pc?.connectionState;
-    if (state === 'connected')     setVideoStatus('green',  `Video live — ${S.partnerAlias}`);
-    if (state === 'disconnected')  setVideoStatus('yellow', 'Connection lost…');
-    if (state === 'failed')        setVideoStatus('red',    'Video failed — text still works');
+    const st = S.pc?.connectionState;
+    if (st === 'connected')    setVideoStatus('green',  `Video live — ${S.partnerAlias}`);
+    if (st === 'disconnected') setVideoStatus('yellow', 'Reconnecting…');
+    if (st === 'failed')       setVideoStatus('red',    'Video failed — text still works');
   };
 
-  // Initiator creates the offer
   if (isInitiator) {
-    setVideoStatus('yellow', 'Waiting for partner camera…');
+    // We create the offer
+    setVideoStatus('yellow', 'Starting video call…');
     const offer = await S.pc.createOffer();
     await S.pc.setLocalDescription(offer);
     S.socket.emit('webrtc_offer', { offer });
+    setVideoStatus('yellow', 'Waiting for partner…');
   } else {
     setVideoStatus('yellow', 'Connecting video…');
+    // Process any offer that arrived before PC was ready
+    if (_pendingOffer) {
+      await handleOffer(_pendingOffer);
+      _pendingOffer = null;
+    }
+    // Drain buffered ICE candidates
+    for (const c of _pendingCandidates) {
+      try { await S.pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
+    }
+    _pendingCandidates = [];
   }
 }
 
+async function handleOffer(offer) {
+  if (!S.pc) return;
+  await S.pc.setRemoteDescription(new RTCSessionDescription(offer));
+  const answer = await S.pc.createAnswer();
+  await S.pc.setLocalDescription(answer);
+  S.socket.emit('webrtc_answer', { answer });
+}
+
 function stopWebRTC() {
+  _pendingOffer      = null;
+  _pendingCandidates = [];
   if (S.localStream) {
     S.localStream.getTracks().forEach(t => t.stop());
     S.localStream = null;
   }
-  if (S.pc) {
-    S.pc.close();
-    S.pc = null;
-  }
+  if (S.pc) { S.pc.close(); S.pc = null; }
   const lv = document.getElementById('local-video');
   const rv = document.getElementById('remote-video');
   if (lv) lv.srcObject = null;
